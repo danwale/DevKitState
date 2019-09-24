@@ -1,0 +1,5 @@
+.DS_Store
+Device/.build
+DevKitState.code-workspace
+.vscode
+.azurecomponent
