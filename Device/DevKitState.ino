@@ -1,9 +1,12 @@
 #include "Arduino.h"
 #include "AZ3166WiFi.h"
+#include "AzureIotHub.h"
 #include "DevKitMQTTClient.h"
 #include "SystemVersion.h"
 #include "Sensor.h"
 #include "parson.h"
+#include "SystemTickCounter.h"
+#include "config.h"
 
 DevI2C *ext_i2c;
 LSM6DSLSensor *acc_gyro;
@@ -19,6 +22,11 @@ static int rgbLEDState = 0;
 static int rgbLEDR = 0;
 static int rgbLEDG = 0;
 static int rgbLEDB = 0;
+
+int messageCount = 1;
+int sentMessageCount = 0;
+static bool messageSending = true;
+static uint64_t send_interval_ms;
 
 int btnAState;
 
@@ -133,6 +141,49 @@ static void DeviceTwinCallback(DEVICE_TWIN_UPDATE_STATE updateState, const unsig
   free(temp);
 }
 
+static void SendConfirmationCallback(IOTHUB_CLIENT_CONFIRMATION_RESULT result)
+{
+  if (result == IOTHUB_CLIENT_CONFIRMATION_OK)
+  {
+    sentMessageCount++;
+  }
+
+  char line1[20];
+  sprintf(line1, "Count: %d/%d", sentMessageCount, messageCount);
+  Screen.print(2, line1);
+
+  messageCount++;
+}
+
+static int DeviceMethodCallback(const char *methodName, const unsigned char *payload, int size, unsigned char **response, int *response_size)
+{
+  LogInfo("Try to invoke method %s", methodName);
+  const char *responseMessage = "\"Successfully invoke device method\"";
+  int result = 200;
+
+  if (strcmp(methodName, "start") == 0)
+  {
+    LogInfo("Start sending temperature and humidity data");
+    messageSending = true;
+  }
+  else if (strcmp(methodName, "stop") == 0)
+  {
+    LogInfo("Stop sending temperature and humidity data");
+    messageSending = false;
+  }
+  else
+  {
+    LogInfo("No method %s found", methodName);
+    responseMessage = "\"No method found\"";
+    result = 404;
+  }
+
+  *response_size = strlen(responseMessage) + 1;
+  *response = (unsigned char *)strdup(responseMessage);
+
+  return result;
+}
+
 static void ReportConfirmationCallback(int statusCode)
 {
   LogInfo("Status Code for Report State: %d", statusCode);
@@ -163,8 +214,12 @@ static void SetupMQTTClient()
 {
   Screen.print(3, " > IoT Hub");
   DevKitMQTTClient_Init(true);
+  DevKitMQTTClient_SetSendConfirmationCallback(SendConfirmationCallback);
   DevKitMQTTClient_SetDeviceTwinCallback(DeviceTwinCallback);
   DevKitMQTTClient_SetReportConfirmationCallback(ReportConfirmationCallback);
+  DevKitMQTTClient_SetDeviceMethodCallback(DeviceMethodCallback);
+
+  send_interval_ms = SystemTickCounterRead();
 }
 
 bool i2cError = false;
@@ -177,14 +232,47 @@ int sensorIrda;
 float temperature;
 float humidity;
 float pressure;
-
 int axes[3];
+
+bool createTelemetryMessage(int messageId, char *payload)
+{
+  JSON_Value *root_value = json_value_init_object();
+  JSON_Object *root_object = json_value_get_object(root_value);
+
+  char *serialized_string = NULL;
+
+  json_object_set_number(root_object, "messageId", messageId);
+
+  json_object_set_number(root_object, "temperature", temperature);
+  json_object_set_number(root_object, "humitidy", humidity);
+  json_object_set_number(root_object, "pressure", pressure);
+  serialized_string = json_serialize_to_string(root_value);
+
+  snprintf(payload, MESSAGE_TELEMETRY_MAX_LEN, "%s", serialized_string);
+  json_free_serialized_string(serialized_string);
+  json_value_free(root_value);
+
+  if (temperature >= TEMPERATURE_ALERT) 
+  {
+    return true;
+  }
+  else
+  {
+    return false;
+  }
+}
+
+int getInterval()
+{
+  return INTERVAL;
+}
 
 void loop()
 {
   if (hasWifi)
   {
     DevKitMQTTClient_Check();
+
     const char *firmwareVersion = getDevkitVersion();
     const char *wifiSSID = WiFi.SSID();
     int wifiRSSI = WiFi.RSSI();
@@ -194,6 +282,7 @@ void loop()
     char macAddress[18];
     WiFi.macAddress(mac);
     snprintf(macAddress, 18, "%02x-%02x-%02x-%02x-%02x-%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
     try
     {
       ext_i2c = new DevI2C(D14, D15);
@@ -242,6 +331,7 @@ void loop()
         if (sensorInitResult == 0)
         {
           sensorHumidityAndTemperature = 1;
+          ht_sensor->reset();
           ht_sensor->getTemperature(&temperature);
           ht_sensor->getHumidity(&humidity);
         }
@@ -348,8 +438,8 @@ void loop()
     (void)json_object_set_string(root_object, "firmwareVersion", firmwareVersion);
     (void)json_object_dotset_string(root_object, "wifi.wifiSSID", wifiSSID);
     (void)json_object_dotset_number(root_object, "wifi.wifiRSSI", wifiRSSI);
-    (void)json_object_dotset_string(root_object, "wifi.wifiIP", WiFi.localIP().get_address());
-    (void)json_object_dotset_string(root_object, "wifi.wifiMask", WiFi.subnetMask().get_address());
+    (void)json_object_dotset_string(root_object, "wifi.wifiIP", wifiIP);
+    (void)json_object_dotset_string(root_object, "wifi.wifiMask", wifiMask);
     (void)json_object_dotset_string(root_object, "wifi.macAddress", macAddress);
 
     (void)json_object_dotset_number(root_object, "sensor.sensorMotion", sensorMotion);
@@ -367,7 +457,6 @@ void loop()
     state = json_serialize_to_string(root_value);
 
     json_value_free(root_value);
-
     if (!DevKitMQTTClient_ReportState(state))
     {
       Screen.print(3, "R.State Failed");
@@ -375,6 +464,17 @@ void loop()
     else
     {
       Screen.print(3, "R.State Success");
+    }
+
+    if (messageSending && (int)(SystemTickCounterRead() - send_interval_ms) >= getInterval())
+    {
+      char messagePayload[MESSAGE_TELEMETRY_MAX_LEN];
+      bool temperatureAlert = createTelemetryMessage(messageCount, messagePayload);
+      EVENT_INSTANCE* message = DevKitMQTTClient_Event_Generate(messagePayload, MESSAGE);
+      DevKitMQTTClient_Event_AddProp(message, "temperatureAlert", temperatureAlert ? "true" : "false");
+      DevKitMQTTClient_SendEventInstance(message);
+
+      send_interval_ms = SystemTickCounterRead();
     }
   }
   else
